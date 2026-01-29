@@ -14,6 +14,9 @@ os.environ['MINERU_WORKER_NUM'] = '0'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['ONNXRUNTIME_LOG_SEVERITY_LEVEL'] = '3'  # 隐藏 ONNX Runtime 警告
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 帮助 MIG 兼容性
+os.environ['TORCH_USE_CUDA_DSA'] = '1'  # 设备端断言
 
 # Monkey-patch: 将 ProcessPoolExecutor 替换为 ThreadPoolExecutor
 import concurrent.futures
@@ -94,7 +97,7 @@ from pathlib import Path
 @spaces.GPU(duration=300)
 def parse_document(
     file,
-    backend: str = "pipeline",
+    backend: str = "vlm-auto-engine",  # VLM 模式更兼容 MIG GPU
     lang: str = "ch",
     max_pages: int = 20,
     table_enable: bool = True,
@@ -207,11 +210,11 @@ with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft
 
             backend = gr.Dropdown(
                 choices=[
-                    ("Pipeline 模式 (推荐)", "pipeline"),
+                    ("VLM 模式 (推荐)", "vlm-auto-engine"),
                     ("混合模式", "hybrid-auto-engine"),
-                    ("VLM 模式 (高精度)", "vlm-auto-engine"),
+                    ("Pipeline 模式", "pipeline"),
                 ],
-                value="pipeline",
+                value="vlm-auto-engine",
                 label="解析后端",
             )
 
@@ -250,9 +253,9 @@ with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft
     gr.Markdown("""
     ---
     ### 📝 说明
-    - **Pipeline 模式**: 最稳定，推荐 ZeroGPU 使用
+    - **VLM 模式**: 推荐，兼容 ZeroGPU MIG 分区
     - **混合模式**: 综合精度和速度
-    - **VLM 模式**: 最高精度，适合复杂文档
+    - **Pipeline 模式**: 可能在 MIG GPU 上有兼容性问题
 
     ### ⚠️ 注意
     - ZeroGPU 有使用配额限制
