@@ -1,91 +1,142 @@
 """
 MinerU PDF 解析器 - HuggingFace Spaces ZeroGPU 版本
-使用 monkey-patch 解决 daemonic processes 问题
+修复 H200 MIG (slice) CUBLAS 兼容性问题
 """
 
 # ============================================
-# 关键：在导入任何其他模块之前进行 monkey-patch
+# 关键：在导入任何其他模块之前设置环境变量
 # ============================================
 import os
 import sys
 
-# 禁用多进程相关环境变量
+# 禁用多进程
 os.environ['MINERU_WORKER_NUM'] = '0'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-os.environ['ONNXRUNTIME_LOG_SEVERITY_LEVEL'] = '3'  # 隐藏 ONNX Runtime 警告
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 帮助 MIG 兼容性
-os.environ['TORCH_USE_CUDA_DSA'] = '1'  # 设备端断言
 
-# Monkey-patch: 将 ProcessPoolExecutor 替换为 ThreadPoolExecutor
+# 隐藏警告
+os.environ['ONNXRUNTIME_LOG_SEVERITY_LEVEL'] = '3'
+
+# 禁用 Flash Attention，强制 eager 模式
+os.environ['ATTN_BACKEND'] = 'eager'
+os.environ['TRANSFORMERS_ATTN_IMPLEMENTATION'] = 'eager'
+
+# CUDA 设置
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# ============================================
+# Monkey-patch ProcessPoolExecutor
+# ============================================
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
-# 保存原始的 ProcessPoolExecutor
-_OriginalProcessPoolExecutor = concurrent.futures.ProcessPoolExecutor
-
-# 创建一个假的 ProcessPoolExecutor，实际使用 ThreadPoolExecutor
 class FakeProcessPoolExecutor(ThreadPoolExecutor):
-    """用 ThreadPoolExecutor 替代 ProcessPoolExecutor，避免 daemon 进程问题"""
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
-        # 忽略 mp_context 参数，因为 ThreadPoolExecutor 不需要
         super().__init__(max_workers=max_workers, initializer=initializer, initargs=initargs)
 
-# 替换
 concurrent.futures.ProcessPoolExecutor = FakeProcessPoolExecutor
 
-# 同时替换 multiprocessing.Pool
 import multiprocessing
 import multiprocessing.pool
 
 class FakePool:
-    """用线程模拟 multiprocessing.Pool"""
     def __init__(self, processes=None, initializer=None, initargs=(), maxtasksperchild=None, context=None):
         self._executor = ThreadPoolExecutor(max_workers=processes)
-
     def map(self, func, iterable, chunksize=None):
         return list(self._executor.map(func, iterable))
-
     def starmap(self, func, iterable, chunksize=None):
-        def wrapper(args):
-            return func(*args)
-        return list(self._executor.map(wrapper, iterable))
-
+        return list(self._executor.map(lambda args: func(*args), iterable))
     def apply(self, func, args=(), kwds={}):
-        future = self._executor.submit(func, *args, **kwds)
-        return future.result()
-
+        return self._executor.submit(func, *args, **kwds).result()
     def apply_async(self, func, args=(), kwds={}, callback=None, error_callback=None):
         future = self._executor.submit(func, *args, **kwds)
         if callback:
             future.add_done_callback(lambda f: callback(f.result()))
         return future
-
     def close(self):
         self._executor.shutdown(wait=False)
-
     def terminate(self):
         self._executor.shutdown(wait=False, cancel_futures=True)
-
     def join(self):
         self._executor.shutdown(wait=True)
-
     def __enter__(self):
         return self
-
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.terminate()
         return False
 
-# 替换 multiprocessing.Pool
 multiprocessing.Pool = FakePool
 multiprocessing.pool.Pool = FakePool
 
-print("✅ Monkey-patch applied: ProcessPoolExecutor → ThreadPoolExecutor")
+print("✅ Monkey-patch: ProcessPoolExecutor → ThreadPoolExecutor")
 
 # ============================================
-# 现在可以安全导入其他模块
+# Patch Tensor.__matmul__ (@ 运算符) 使用 CPU fallback
+# ============================================
+import torch
+
+# 禁用所有 SDPA 优化，强制使用 math 实现
+if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+    torch.backends.cuda.enable_flash_sdp(False)
+if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+    torch.backends.cuda.enable_math_sdp(True)
+
+print("✅ Disabled Flash/MemEfficient SDPA, using math SDPA only")
+
+# 保存原始方法
+_original_tensor_matmul = torch.Tensor.__matmul__
+_original_matmul = torch.matmul
+_original_bmm = torch.bmm
+_cublas_error_count = 0
+
+def _safe_matmul_impl(a, b, original_fn):
+    """通用的安全矩阵乘法实现"""
+    global _cublas_error_count
+    try:
+        return original_fn(a, b)
+    except RuntimeError as e:
+        if 'CUBLAS' in str(e):
+            _cublas_error_count += 1
+            if _cublas_error_count <= 5:
+                print(f"⚠️ CUBLAS error #{_cublas_error_count}, falling back to CPU")
+            # 回退到 CPU
+            device = a.device
+            dtype = a.dtype
+            result = original_fn(a.float().cpu(), b.float().cpu())
+            return result.to(device=device, dtype=dtype)
+        raise
+
+def safe_tensor_matmul(self, other):
+    """安全的 @ 运算符"""
+    return _safe_matmul_impl(self, other, _original_tensor_matmul)
+
+def safe_matmul(input, other, *, out=None):
+    """安全的 torch.matmul"""
+    if out is not None:
+        # 有 out 参数时不能简单回退
+        return _original_matmul(input, other, out=out)
+    return _safe_matmul_impl(input, other, _original_matmul)
+
+def safe_bmm(input, mat2, *, out=None):
+    """安全的 torch.bmm"""
+    if out is not None:
+        return _original_bmm(input, mat2, out=out)
+    return _safe_matmul_impl(input, mat2, _original_bmm)
+
+# 应用 patches
+torch.Tensor.__matmul__ = safe_tensor_matmul
+torch.matmul = safe_matmul
+torch.bmm = safe_bmm
+
+print("✅ Monkey-patch: Tensor.__matmul__/matmul/bmm with CPU fallback")
+
+# ============================================
+# 导入其他模块
 # ============================================
 import spaces
 import gradio as gr
@@ -97,9 +148,9 @@ from pathlib import Path
 @spaces.GPU(duration=300)
 def parse_document(
     file,
-    backend: str = "vlm-auto-engine",  # VLM 模式更兼容 MIG GPU
+    backend: str = "vlm-auto-engine",
     lang: str = "ch",
-    max_pages: int = 20,
+    max_pages: int = 5,
     table_enable: bool = True,
     formula_enable: bool = True,
 ):
@@ -110,6 +161,11 @@ def parse_document(
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"✅ GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+
+        # 再次确保 SDPA 设置正确
+        if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
     else:
         print("❌ No GPU available!")
         return "错误：GPU 不可用", "", 0
@@ -173,12 +229,10 @@ def parse_document(
                 print(status)
                 return status, markdown, elapsed
             else:
-                # 查找可能的输出文件
                 for root, dirs, files in os.walk(output_dir):
                     for f in files:
                         if f.endswith('.md'):
-                            md_file = os.path.join(root, f)
-                            with open(md_file, "r", encoding="utf-8") as file:
+                            with open(os.path.join(root, f), "r", encoding="utf-8") as file:
                                 markdown = file.read()
                             return f"✅ 解析成功！耗时 {elapsed:.1f} 秒", markdown, elapsed
                 return f"❌ 解析失败：未找到输出文件", "", elapsed
@@ -193,12 +247,12 @@ def parse_document(
 
 
 # Gradio 界面
-with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU)", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
     # 📄 MinerU PDF 解析器
-    ### 🚀 Powered by HuggingFace ZeroGPU (NVIDIA H200 70GB)
+    ### 🚀 Powered by HuggingFace ZeroGPU (H200 Slice)
 
-    将 PDF/图片转换为 Markdown 格式，支持表格、公式识别。
+    将 PDF/图片转换为 Markdown，支持表格、公式识别。
     """)
 
     with gr.Row():
@@ -223,15 +277,12 @@ with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft
                     ("中文", "ch"),
                     ("英文", "en"),
                     ("自动检测", "auto"),
-                    ("日文", "japan"),
-                    ("韩文", "korean"),
-                    ("拉丁语系", "latin"),
                 ],
                 value="ch",
                 label="文档语言",
             )
 
-            max_pages = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="最大页数")
+            max_pages = gr.Slider(minimum=1, maximum=20, value=3, step=1, label="最大页数")
 
             with gr.Row():
                 table_enable = gr.Checkbox(value=True, label="表格识别")
@@ -252,14 +303,10 @@ with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft
 
     gr.Markdown("""
     ---
-    ### 📝 说明
-    - **VLM 模式**: 推荐，兼容 ZeroGPU MIG 分区
-    - **混合模式**: 综合精度和速度
-    - **Pipeline 模式**: 可能在 MIG GPU 上有兼容性问题
-
-    ### ⚠️ 注意
-    - ZeroGPU 有使用配额限制
-    - 建议先用小文档测试
+    ### ⚠️ 说明
+    - H200 MIG 分区可能存在 CUBLAS 兼容性问题
+    - 如果解析失败，会自动回退到 CPU 计算（较慢但稳定）
+    - 建议先用 1-3 页测试
     """)
 
 if __name__ == "__main__":
