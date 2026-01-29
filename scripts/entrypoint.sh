@@ -19,6 +19,26 @@ fi
 # 确保目录存在
 mkdir -p "$MODELS_DIR"
 
+# ============================================
+# 【重要】先创建配置文件，再下载模型
+# ============================================
+export MINERU_MODEL_SOURCE=local
+
+CONFIG_FILE="${HOME}/.mineru.json"
+cat > "$CONFIG_FILE" << EOF
+{
+    "models-dir": {
+        "pipeline": "${MODELS_DIR}",
+        "vlm": "${MODELS_DIR}"
+    },
+    "config_version": "1.3.1"
+}
+EOF
+echo "[INFO] Configuration file created at $CONFIG_FILE"
+
+# 设置环境变量指向配置文件
+export MINERU_TOOLS_CONFIG_JSON="$CONFIG_FILE"
+
 # 检查模型是否存在
 MODEL_CHECK_FILE="${MODELS_DIR}/.models_ready"
 
@@ -35,23 +55,6 @@ if [ ! -f "$MODEL_CHECK_FILE" ]; then
 else
     echo "[INFO] Models already present, skipping download"
 fi
-
-# 设置模型路径环境变量
-export MINERU_MODEL_SOURCE=local
-
-# 创建 MinerU 配置文件
-CONFIG_FILE="${HOME}/.mineru.json"
-cat > "$CONFIG_FILE" << EOF
-{
-    "models-dir": {
-        "pipeline": "${MODELS_DIR}",
-        "vlm": "${MODELS_DIR}"
-    },
-    "config_version": "1.3.1"
-}
-EOF
-
-echo "[INFO] Configuration file created at $CONFIG_FILE"
 
 # 显示配置信息
 echo "[INFO] Configuration:"
