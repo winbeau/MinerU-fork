@@ -1,3 +1,4 @@
 # MinerU PDF Parser for HuggingFace Spaces ZeroGPU
 mineru[core]
 gradio==5.49.1
+doclayout-yolo
