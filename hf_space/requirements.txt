@@ -1,0 +1,5 @@
+# MinerU PDF Parser for HuggingFace Spaces ZeroGPU
+mineru[core]>=2.7.0
+torch>=2.0.0
+gradio>=4.0.0
+spaces
