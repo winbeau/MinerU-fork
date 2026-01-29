@@ -1,0 +1,118 @@
+# =============================================================================
+# MinerU RunPod Serverless Dockerfile
+# 优化目标：冷启动快速、模型持久化、GPU 加速
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 基础镜像选择说明：
+# - vllm/vllm-openai:v0.10.1.1: Ampere/Ada/Hopper (Compute Capability 8.0-9.0)
+# - vllm/vllm-openai:v0.11.0: Volta/Turing/Blackwell (CC 7.0-8.0 或 >=10.0)
+# RunPod 常用 A100/A40/L40S 等均在 CC 8.0-9.0 范围
+# -----------------------------------------------------------------------------
+FROM vllm/vllm-openai:v0.10.1.1
+
+LABEL maintainer="your-email@example.com"
+LABEL version="1.0.0"
+LABEL description="MinerU PDF Parser for RunPod Serverless"
+
+# -----------------------------------------------------------------------------
+# 构建参数
+# -----------------------------------------------------------------------------
+ARG PREDOWNLOAD_MODELS=0
+
+# -----------------------------------------------------------------------------
+# 环境变量配置
+# -----------------------------------------------------------------------------
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    # MinerU 核心配置
+    MINERU_MODEL_SOURCE=local \
+    MINERU_LOG_LEVEL=INFO \
+    MINERU_DEVICE_MODE=gpu \
+    # API 配置
+    MINERU_API_ENABLE_FASTAPI_DOCS=1 \
+    MINERU_API_MAX_CONCURRENT_REQUESTS=2 \
+    # 模型目录（支持持久化卷挂载）
+    MINERU_MODELS_DIR=/workspace/models \
+    # 输出目录
+    MINERU_OUTPUT_DIR=/tmp/mineru_output \
+    # 服务端口
+    PORT=8000
+
+# -----------------------------------------------------------------------------
+# 系统依赖安装
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # OpenCV 依赖
+    libgl1 \
+    libglib2.0-0 \
+    # 中文字体支持
+    fonts-noto-core \
+    fonts-noto-cjk \
+    fontconfig \
+    # 网络工具（调试用）
+    curl \
+    wget \
+    && fc-cache -fv \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# -----------------------------------------------------------------------------
+# Python 依赖安装
+# 选型说明：使用 pip 而非 uv，因为 vLLM 基础镜像已有完整的 pip 环境
+# uv 更适合全新环境，此处复用基础镜像的依赖更高效
+# -----------------------------------------------------------------------------
+WORKDIR /app
+
+# 安装 MinerU 核心包（含 vLLM 支持）
+RUN python3 -m pip install --no-cache-dir -U \
+    'mineru[core,vllm]>=2.7.0' \
+    # 额外依赖：异步任务、URL 下载
+    aiofiles \
+    aiohttp \
+    python-multipart \
+    && python3 -m pip cache purge
+
+# -----------------------------------------------------------------------------
+# 模型下载策略
+# 选项 1: 构建时下载（镜像较大 ~25GB，冷启动快）
+# 选项 2: 运行时下载（镜像较小 ~5GB，首次启动慢）
+#
+# 推荐：使用 RunPod 持久化卷挂载，避免重复下载
+# -----------------------------------------------------------------------------
+
+# 创建模型目录
+RUN mkdir -p ${MINERU_MODELS_DIR} ${MINERU_OUTPUT_DIR}
+
+# 条件下载模型（通过构建参数控制）
+RUN if [ "$PREDOWNLOAD_MODELS" = "1" ]; then \
+        echo "Pre-downloading models..." && \
+        mineru-models-download -s huggingface -m all && \
+        touch ${MINERU_MODELS_DIR}/.models_ready; \
+    fi
+
+# -----------------------------------------------------------------------------
+# 复制脚本和 API 服务代码
+# -----------------------------------------------------------------------------
+COPY scripts/entrypoint.sh /app/entrypoint.sh
+COPY scripts/download_models.sh /app/scripts/download_models.sh
+COPY runpod_api/ /app/runpod_api/
+
+RUN chmod +x /app/entrypoint.sh /app/scripts/download_models.sh
+
+# -----------------------------------------------------------------------------
+# 健康检查
+# -----------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
+
+# -----------------------------------------------------------------------------
+# 暴露端口
+# -----------------------------------------------------------------------------
+EXPOSE ${PORT}
+
+# -----------------------------------------------------------------------------
+# 启动命令
+# -----------------------------------------------------------------------------
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python3", "-m", "runpod_api.server", "--host", "0.0.0.0", "--port", "8000"]
