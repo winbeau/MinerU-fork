@@ -1,14 +1,89 @@
 """
 MinerU PDF 解析器 - HuggingFace Spaces ZeroGPU 版本
-修复 daemonic processes 错误
+使用 monkey-patch 解决 daemonic processes 问题
 """
 
-# 必须在最开始设置，禁用多进程
+# ============================================
+# 关键：在导入任何其他模块之前进行 monkey-patch
+# ============================================
 import os
-os.environ['MINERU_WORKER_NUM'] = '0'  # 禁用 worker 进程
-os.environ['OMP_NUM_THREADS'] = '1'  # 限制 OpenMP 线程
-os.environ['MKL_NUM_THREADS'] = '1'  # 限制 MKL 线程
+import sys
 
+# 禁用多进程相关环境变量
+os.environ['MINERU_WORKER_NUM'] = '0'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+# Monkey-patch: 将 ProcessPoolExecutor 替换为 ThreadPoolExecutor
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+# 保存原始的 ProcessPoolExecutor
+_OriginalProcessPoolExecutor = concurrent.futures.ProcessPoolExecutor
+
+# 创建一个假的 ProcessPoolExecutor，实际使用 ThreadPoolExecutor
+class FakeProcessPoolExecutor(ThreadPoolExecutor):
+    """用 ThreadPoolExecutor 替代 ProcessPoolExecutor，避免 daemon 进程问题"""
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
+        # 忽略 mp_context 参数，因为 ThreadPoolExecutor 不需要
+        super().__init__(max_workers=max_workers, initializer=initializer, initargs=initargs)
+
+# 替换
+concurrent.futures.ProcessPoolExecutor = FakeProcessPoolExecutor
+
+# 同时替换 multiprocessing.Pool
+import multiprocessing
+import multiprocessing.pool
+
+class FakePool:
+    """用线程模拟 multiprocessing.Pool"""
+    def __init__(self, processes=None, initializer=None, initargs=(), maxtasksperchild=None, context=None):
+        self._executor = ThreadPoolExecutor(max_workers=processes)
+
+    def map(self, func, iterable, chunksize=None):
+        return list(self._executor.map(func, iterable))
+
+    def starmap(self, func, iterable, chunksize=None):
+        def wrapper(args):
+            return func(*args)
+        return list(self._executor.map(wrapper, iterable))
+
+    def apply(self, func, args=(), kwds={}):
+        future = self._executor.submit(func, *args, **kwds)
+        return future.result()
+
+    def apply_async(self, func, args=(), kwds={}, callback=None, error_callback=None):
+        future = self._executor.submit(func, *args, **kwds)
+        if callback:
+            future.add_done_callback(lambda f: callback(f.result()))
+        return future
+
+    def close(self):
+        self._executor.shutdown(wait=False)
+
+    def terminate(self):
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def join(self):
+        self._executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.terminate()
+        return False
+
+# 替换 multiprocessing.Pool
+multiprocessing.Pool = FakePool
+multiprocessing.pool.Pool = FakePool
+
+print("✅ Monkey-patch applied: ProcessPoolExecutor → ThreadPoolExecutor")
+
+# ============================================
+# 现在可以安全导入其他模块
+# ============================================
 import spaces
 import gradio as gr
 import tempfile
@@ -16,22 +91,18 @@ import time
 from pathlib import Path
 
 
-@spaces.GPU(duration=300)  # 5分钟，单进程可能更慢
+@spaces.GPU(duration=300)
 def parse_document(
     file,
-    backend: str = "pipeline",  # 默认用 pipeline，更稳定
+    backend: str = "pipeline",
     lang: str = "ch",
     max_pages: int = 20,
     table_enable: bool = True,
     formula_enable: bool = True,
 ):
-    """
-    GPU 加速的文档解析函数
-    使用单进程模式避免 daemonic process 错误
-    """
+    """GPU 加速的文档解析函数"""
     import torch
 
-    # 确认 GPU 可用
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -46,93 +117,20 @@ def parse_document(
     start_time = time.time()
 
     try:
-        # 在 GPU 函数内部导入，避免提前初始化
-        from mineru.cli.common import read_fn
-        from mineru.version import __version__
-
-        # 使用更底层的 API 避免多进程
-        from mineru.pdf_parser import PDFParser
-
-        # 创建临时输出目录
-        with tempfile.TemporaryDirectory() as output_dir:
-            # 读取文件
-            file_path = Path(file.name if hasattr(file, 'name') else file)
-            pdf_bytes = read_fn(file_path)
-            file_stem = file_path.stem
-
-            print(f"📄 开始解析: {file_stem}")
-            print(f"   Backend: {backend}")
-            print(f"   Language: {lang}")
-            print(f"   Max pages: {max_pages}")
-
-            # 设置解析参数
-            end_page = max_pages - 1 if max_pages else 99999
-
-            # 使用 PDFParser 直接解析（单进程）
-            parser = PDFParser(
-                pdf_bytes=pdf_bytes,
-                model_backend=backend,
-                lang=lang,
-                formula_enable=formula_enable,
-                table_enable=table_enable,
-            )
-
-            # 解析文档
-            result = parser.parse(
-                start_page=0,
-                end_page=end_page,
-            )
-
-            elapsed = time.time() - start_time
-
-            # 获取 Markdown 结果
-            if hasattr(result, 'get_markdown'):
-                markdown = result.get_markdown()
-            elif hasattr(result, 'markdown'):
-                markdown = result.markdown
-            elif isinstance(result, str):
-                markdown = result
-            else:
-                # 尝试从 result 提取内容
-                markdown = str(result)
-
-            status = f"✅ 解析成功！耗时 {elapsed:.1f} 秒 (MinerU v{__version__}, GPU: {gpu_name})"
-            print(status)
-            return status, markdown, elapsed
-
-    except ImportError as e:
-        # 如果 PDFParser 不可用，回退到 do_parse
-        print(f"⚠️ PDFParser 不可用，尝试 do_parse: {e}")
-        return parse_with_do_parse(file, backend, lang, max_pages, table_enable, formula_enable, start_time)
-
-    except Exception as e:
-        elapsed = time.time() - start_time
-        error_msg = f"❌ 解析错误: {str(e)}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg, "", elapsed
-
-
-def parse_with_do_parse(file, backend, lang, max_pages, table_enable, formula_enable, start_time):
-    """回退方案：使用 do_parse"""
-    import torch
-
-    try:
         from mineru.cli.common import do_parse, read_fn
         from mineru.version import __version__
 
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
-
         with tempfile.TemporaryDirectory() as output_dir:
             file_path = Path(file.name if hasattr(file, 'name') else file)
             pdf_bytes = read_fn(file_path)
             file_stem = file_path.stem
             end_page = max_pages - 1 if max_pages else 99999
 
-            # 设置环境变量禁用并行
             os.environ['MINERU_VLM_FORMULA_ENABLE'] = str(formula_enable)
             os.environ['MINERU_VLM_TABLE_ENABLE'] = str(table_enable)
+
+            print(f"📄 开始解析: {file_stem}")
+            print(f"   Backend: {backend}, Language: {lang}, Max pages: {max_pages}")
 
             do_parse(
                 output_dir=output_dir,
@@ -169,15 +167,26 @@ def parse_with_do_parse(file, backend, lang, max_pages, table_enable, formula_en
                 with open(md_path, "r", encoding="utf-8") as f:
                     markdown = f.read()
                 status = f"✅ 解析成功！耗时 {elapsed:.1f} 秒 (MinerU v{__version__}, GPU: {gpu_name})"
+                print(status)
                 return status, markdown, elapsed
             else:
+                # 查找可能的输出文件
+                for root, dirs, files in os.walk(output_dir):
+                    for f in files:
+                        if f.endswith('.md'):
+                            md_file = os.path.join(root, f)
+                            with open(md_file, "r", encoding="utf-8") as file:
+                                markdown = file.read()
+                            return f"✅ 解析成功！耗时 {elapsed:.1f} 秒", markdown, elapsed
                 return f"❌ 解析失败：未找到输出文件", "", elapsed
 
     except Exception as e:
         elapsed = time.time() - start_time
+        error_msg = f"❌ 解析错误: {str(e)}"
+        print(error_msg)
         import traceback
         traceback.print_exc()
-        return f"❌ 解析错误: {str(e)}", "", elapsed
+        return error_msg, "", elapsed
 
 
 # Gradio 界面
@@ -219,13 +228,7 @@ with gr.Blocks(title="MinerU PDF 解析器 (ZeroGPU H200)", theme=gr.themes.Soft
                 label="文档语言",
             )
 
-            max_pages = gr.Slider(
-                minimum=1,
-                maximum=50,
-                value=10,
-                step=1,
-                label="最大页数",
-            )
+            max_pages = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="最大页数")
 
             with gr.Row():
                 table_enable = gr.Checkbox(value=True, label="表格识别")
